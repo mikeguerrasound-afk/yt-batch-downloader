@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""
-Simple batch video downloader (GUI wrapper around yt-dlp).
+"""Batch video downloader: a quiet, dark GUI around yt-dlp.
 
-Requirements:
-    pip install -U yt-dlp
-    ffmpeg installed and on PATH (needed to merge best video + best audio)
-
-Run:
-    python yt_batch_downloader.py
+Run from source:
+    pip install -r requirements.txt
+    python app.py
 """
 import os
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import filedialog
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    raise SystemExit("customtkinter is not installed. Run: pip install -r requirements.txt")
 
 try:
     import yt_dlp
@@ -22,92 +24,276 @@ try:
 except ImportError:
     raise SystemExit("yt-dlp is not installed. Run: pip install -U yt-dlp")
 
-# Use the ffmpeg binary bundled via imageio-ffmpeg when available (packaged
-# builds); otherwise fall back to whatever ffmpeg is on PATH.
+# Use the ffmpeg bundled via imageio-ffmpeg when available (packaged builds);
+# otherwise fall back to whatever ffmpeg is on PATH.
 try:
     import imageio_ffmpeg
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:  # noqa: BLE001
     FFMPEG_PATH = None
 
-QUALITIES = ["Best available", "2160p (4K)", "1440p", "1080p", "720p", "480p"]
-HEIGHTS = {"Best available": None, "2160p (4K)": 2160, "1440p": 1440,
-           "1080p": 1080, "720p": 720, "480p": 480}
-VIDEO_CONTAINERS = ["mkv", "mp4"]
+# ---- design tokens -------------------------------------------------------
+BG = "#14171C"          # window
+PANEL = "#1C2027"       # inputs
+PANEL_HI = "#252A33"    # controls, hover
+LINE = "#2C323C"        # hairlines
+INK = "#101318"         # log well
+TEXT = "#E6E8EB"
+MUTED = "#8A93A3"
+ACCENT = "#3F74E0"
+ACCENT_HOVER = "#5586EA"
+# Level-meter colours (functional, like a console meter)
+METER_OFF = "#232831"
+GREEN = "#3DDC97"
+AMBER = "#F2B544"
+RED = "#EF5B5B"
+
+if sys.platform.startswith("win"):
+    UI_FONT, MONO = "Segoe UI", "Consolas"
+elif sys.platform == "darwin":
+    UI_FONT, MONO = "Helvetica Neue", "Menlo"
+else:
+    UI_FONT, MONO = "DejaVu Sans", "DejaVu Sans Mono"
+
+QUALITIES = ["Best", "4K", "1440p", "1080p", "720p", "480p"]
+HEIGHTS = {"Best": None, "4K": 2160, "1440p": 1440, "1080p": 1080, "720p": 720, "480p": 480}
+VIDEO_CONTAINERS = ["mp4", "mkv"]
 AUDIO_FORMATS = ["wav", "flac", "mp3", "m4a"]
+PLACEHOLDER = "Paste links, one per line.\nVideos, playlists and channels all work."
+PADX = 32
 
 
-class App(tk.Tk):
+def font(size, weight="normal", family=None):
+    return ctk.CTkFont(family=family or UI_FONT, size=size, weight=weight)
+
+
+class Meter(tk.Canvas):
+    """Segmented level meter used as the progress indicator."""
+    SEGMENTS = 48
+
+    def __init__(self, master, **kw):
+        super().__init__(master, height=12, highlightthickness=0, bd=0, bg=BG, **kw)
+        self.value = 0.0
+        self.bind("<Configure>", lambda _e: self._redraw())
+
+    def set(self, v):
+        v = max(0.0, min(1.0, v))
+        if v == self.value:
+            return
+        self.value = v
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 20:
+            return
+        n, gap = self.SEGMENTS, 3
+        seg = (w - gap * (n - 1)) / n
+        lit = round(self.value * n)
+        for i in range(n):
+            x0 = i * (seg + gap)
+            if i < lit:
+                frac = i / (n - 1)
+                col = GREEN if frac < 0.65 else AMBER if frac < 0.88 else RED
+            else:
+                col = METER_OFF
+            self.create_rectangle(x0, 0, x0 + seg, h, fill=col, outline="")
+
+
+class App(ctk.CTk):
     def __init__(self):
-        super().__init__()
-        self.title("Batch Video Downloader")
-        self.geometry("760x640")
+        super().__init__(fg_color=BG)
+        ctk.set_appearance_mode("dark")
+        self.title("Batch video downloader")
+        self.geometry("860x780")
+        self.minsize(720, 660)
+
         self.log_q = queue.Queue()
         self.cancel_flag = threading.Event()
         self.worker = None
+        self._placeholder_on = False
 
         self.out_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
-        self.quality = tk.StringVar(value=QUALITIES[0])
-        self.container = tk.StringVar(value="mp4")
-        self.audio_only = tk.BooleanVar(value=False)
-        self.audio_fmt = tk.StringVar(value="wav")
+        self.quality = tk.StringVar(value="Best")
+        self.fmt = tk.StringVar(value="mp4")
         self.no_playlist = tk.BooleanVar(value=False)
 
         self._build()
+        self._show_placeholder()
         self.after(100, self._drain_log)
 
+    # ---- layout ----------------------------------------------------------
     def _build(self):
-        pad = {"padx": 10, "pady": 4}
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
-        ttk.Label(self, text="Paste URLs (one per line — videos, playlists or channels):").pack(anchor="w", **pad)
-        self.urls = ScrolledText(self, height=10)
-        self.urls.pack(fill="x", **pad)
+        ctk.CTkLabel(self, text="Batch video downloader", font=font(26, "bold"),
+                     text_color=TEXT, anchor="w").grid(row=0, column=0, sticky="ew", padx=PADX, pady=(28, 18))
 
-        opts = ttk.Frame(self)
-        opts.pack(fill="x", **pad)
+        # links
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=1, column=0, sticky="ew", padx=PADX)
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="Links", font=font(13, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, sticky="w")
+        self.count = ctk.CTkLabel(head, text="0 links", font=font(12), text_color=MUTED)
+        self.count.grid(row=0, column=1, padx=(0, 12))
+        ctk.CTkButton(head, text="Paste", width=60, height=26, corner_radius=8, font=font(12),
+                      fg_color=PANEL_HI, hover_color=LINE, text_color=TEXT,
+                      command=self._paste).grid(row=0, column=2)
 
-        ttk.Label(opts, text="Quality:").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(opts, textvariable=self.quality, values=QUALITIES,
-                     state="readonly", width=16).grid(row=0, column=1, padx=6)
+        self.urls = ctk.CTkTextbox(self, height=150, corner_radius=14, fg_color=PANEL,
+                                   border_width=1, border_color=LINE, text_color=TEXT,
+                                   font=font(12, family=MONO), wrap="none")
+        self.urls.grid(row=2, column=0, sticky="ew", padx=PADX, pady=(8, 20))
+        self.urls.tag_config("ph", foreground=MUTED)
+        self.urls.bind("<FocusIn>", lambda _e: self._hide_placeholder(), add=True)
+        self.urls.bind("<FocusOut>", lambda _e: self._show_placeholder(), add=True)
+        self.urls.bind("<KeyRelease>", lambda _e: self._update_count(), add=True)
 
-        ttk.Label(opts, text="Container:").grid(row=0, column=2, sticky="w", padx=(12, 0))
-        ttk.Combobox(opts, textvariable=self.container, values=VIDEO_CONTAINERS,
-                     state="readonly", width=6).grid(row=0, column=3, padx=6)
+        # settings
+        opts = ctk.CTkFrame(self, fg_color="transparent")
+        opts.grid(row=3, column=0, sticky="ew", padx=PADX, pady=(0, 18))
+        opts.grid_columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(opts, text="Audio only:", variable=self.audio_only).grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Combobox(opts, textvariable=self.audio_fmt, values=AUDIO_FORMATS,
-                     state="readonly", width=16).grid(row=1, column=1, padx=6)
+        def label(row, text):
+            ctk.CTkLabel(opts, text=text, font=font(13), text_color=MUTED, width=80,
+                         anchor="w").grid(row=row, column=0, sticky="w", pady=7)
 
-        ttk.Checkbutton(opts, text="Single video only (ignore playlist in URL)",
-                        variable=self.no_playlist).grid(row=1, column=2, columnspan=2, sticky="w", padx=(12, 0))
+        seg = dict(height=32, corner_radius=8, border_width=0, font=font(13),
+                   fg_color=PANEL, selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+                   unselected_color=PANEL, unselected_hover_color=PANEL_HI,
+                   text_color=TEXT, text_color_disabled=MUTED)
 
-        folder = ttk.Frame(self)
-        folder.pack(fill="x", **pad)
-        ttk.Label(folder, text="Save to:").pack(side="left")
-        ttk.Entry(folder, textvariable=self.out_dir).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(folder, text="Browse…", command=self._browse).pack(side="left")
+        label(0, "Format")
+        fmt_row = ctk.CTkFrame(opts, fg_color="transparent")
+        fmt_row.grid(row=0, column=1, sticky="w")
+        self.mode_seg = ctk.CTkSegmentedButton(fmt_row, values=["Video", "Audio"],
+                                               command=self._mode_changed, **seg)
+        self.mode_seg.set("Video")
+        self.mode_seg.pack(side="left")
+        self.fmt_menu = ctk.CTkOptionMenu(fmt_row, values=VIDEO_CONTAINERS, variable=self.fmt,
+                                          width=96, height=32, corner_radius=8, font=font(13),
+                                          dropdown_font=font(13), fg_color=PANEL_HI,
+                                          button_color=PANEL_HI, button_hover_color=LINE,
+                                          dropdown_fg_color=PANEL, dropdown_hover_color=PANEL_HI,
+                                          text_color=TEXT, dropdown_text_color=TEXT)
+        self.fmt_menu.pack(side="left", padx=(10, 0))
 
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(btns, text="Download", command=self._start)
-        self.start_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=6)
+        label(1, "Quality")
+        self.quality_seg = ctk.CTkSegmentedButton(opts, values=QUALITIES, variable=self.quality, **seg)
+        self.quality_seg.grid(row=1, column=1, sticky="w")
 
-        self.progress = ttk.Progressbar(self, maximum=100)
-        self.progress.pack(fill="x", **pad)
-        self.status = ttk.Label(self, text="Idle")
-        self.status.pack(anchor="w", padx=10)
+        label(2, "Save to")
+        save_row = ctk.CTkFrame(opts, fg_color="transparent")
+        save_row.grid(row=2, column=1, sticky="ew")
+        save_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(save_row, textvariable=self.out_dir, height=34, corner_radius=10, font=font(12),
+                     fg_color=PANEL, border_color=LINE, border_width=1,
+                     text_color=TEXT).grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(save_row, text="Browse", width=76, height=34, corner_radius=10, font=font(13),
+                      fg_color=PANEL_HI, hover_color=LINE, text_color=TEXT,
+                      command=self._browse).grid(row=0, column=1, padx=(10, 0))
 
-        self.log = ScrolledText(self, height=12, state="disabled")
-        self.log.pack(fill="both", expand=True, **pad)
+        ctk.CTkSwitch(opts, text="Ignore the playlist when a link has one", variable=self.no_playlist,
+                      font=font(13), text_color=MUTED, progress_color=ACCENT, fg_color=PANEL_HI,
+                      button_color=TEXT, button_hover_color=TEXT, switch_width=40,
+                      switch_height=20).grid(row=3, column=1, sticky="w", pady=(10, 0))
 
-    # ---- UI helpers ----
+        # actions + meter
+        act = ctk.CTkFrame(self, fg_color="transparent")
+        act.grid(row=4, column=0, sticky="ew", padx=PADX, pady=(0, 18))
+        act.grid_columnconfigure(0, weight=1)
+
+        self.start_btn = ctk.CTkButton(act, text="Download", height=46, corner_radius=10,
+                                       font=font(15, "bold"), fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                       text_color="#FFFFFF", command=self._start)
+        self.start_btn.grid(row=0, column=0, sticky="ew")
+        ghost = dict(height=46, corner_radius=10, font=font(14), fg_color="transparent",
+                     border_width=1, border_color=LINE, hover_color=PANEL,
+                     text_color=TEXT, text_color_disabled=MUTED)
+        self.cancel_btn = ctk.CTkButton(act, text="Cancel", width=92, state="disabled",
+                                        command=self._cancel, **ghost)
+        self.cancel_btn.grid(row=0, column=1, padx=(10, 0))
+        self.open_btn = ctk.CTkButton(act, text="Open folder", width=116, command=self._open_folder, **ghost)
+        self.open_btn.grid(row=0, column=2, padx=(10, 0))
+
+        self.meter = Meter(act)
+        self.meter.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(18, 8))
+        info = ctk.CTkFrame(act, fg_color="transparent")
+        info.grid(row=2, column=0, columnspan=3, sticky="ew")
+        info.grid_columnconfigure(0, weight=1)
+        self.status = ctk.CTkLabel(info, text="Ready", font=font(13), text_color=MUTED, anchor="w")
+        self.status.grid(row=0, column=0, sticky="ew")
+        self.percent = ctk.CTkLabel(info, text="", font=font(12, family=MONO), text_color=MUTED)
+        self.percent.grid(row=0, column=1)
+
+        # log
+        self.log = ctk.CTkTextbox(self, corner_radius=14, fg_color=INK, border_width=1, border_color=LINE,
+                                  text_color=MUTED, font=font(11, family=MONO), state="disabled")
+        self.log.grid(row=5, column=0, sticky="nsew", padx=PADX, pady=(0, 28))
+
+    # ---- placeholder / input helpers --------------------------------------
+    def _show_placeholder(self):
+        if not self._placeholder_on and not self.urls.get("1.0", "end").strip():
+            self.urls.insert("1.0", PLACEHOLDER, "ph")
+            self._placeholder_on = True
+            self._update_count()
+
+    def _hide_placeholder(self):
+        if self._placeholder_on:
+            self.urls.delete("1.0", "end")
+            self._placeholder_on = False
+
+    def _get_urls(self):
+        if self._placeholder_on:
+            return []
+        return [u.strip() for u in self.urls.get("1.0", "end").splitlines() if u.strip()]
+
+    def _update_count(self):
+        n = len(self._get_urls())
+        self.count.configure(text=f"{n} link" + ("" if n == 1 else "s"))
+
+    def _paste(self):
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            return
+        if not text:
+            return
+        self._hide_placeholder()
+        current = self.urls.get("1.0", "end").rstrip("\n")
+        self.urls.insert("end", ("\n" if current else "") + text)
+        self._update_count()
+
+    def _mode_changed(self, value):
+        if value == "Video":
+            self.fmt_menu.configure(values=VIDEO_CONTAINERS)
+            self.fmt.set("mp4")
+            self.quality_seg.configure(state="normal")
+        else:
+            self.fmt_menu.configure(values=AUDIO_FORMATS)
+            self.fmt.set("wav")
+            self.quality_seg.configure(state="disabled")
+
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self.out_dir.get())
         if d:
             self.out_dir.set(d)
 
+    def _open_folder(self):
+        path = self.out_dir.get()
+        if not os.path.isdir(path):
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+    # ---- thread-safe UI updates -------------------------------------------
     def _log(self, msg):
         self.log_q.put(("log", msg))
 
@@ -121,9 +307,11 @@ class App(tk.Tk):
                     self.log.see("end")
                     self.log.configure(state="disabled")
                 elif kind == "progress":
-                    self.progress["value"] = val
+                    self.meter.set(val / 100)
+                    self.percent.configure(text=f"{val:.0f}%" if val else "")
                 elif kind == "status":
-                    self.status.configure(text=val)
+                    text, color = val
+                    self.status.configure(text=text, text_color=color)
                 elif kind == "done":
                     self.start_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
@@ -131,30 +319,33 @@ class App(tk.Tk):
             pass
         self.after(100, self._drain_log)
 
-    # ---- download logic ----
+    # ---- download logic ---------------------------------------------------
     def _start(self):
-        urls = [u.strip() for u in self.urls.get("1.0", "end").splitlines() if u.strip()]
+        urls = self._get_urls()
         if not urls:
-            self._log("No URLs provided.")
+            self.status.configure(text="Paste at least one link to start.", text_color=AMBER)
             return
         os.makedirs(self.out_dir.get(), exist_ok=True)
         self.cancel_flag.clear()
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        audio = self.mode_seg.get() == "Audio"
         opts = dict(
             out=self.out_dir.get(),
             quality=self.quality.get(),
-            container=self.container.get(),
-            audio_only=self.audio_only.get(),
-            audio_fmt=self.audio_fmt.get(),
+            container=self.fmt.get(),
+            audio_only=audio,
+            audio_fmt=self.fmt.get(),
             no_playlist=self.no_playlist.get(),
         )
+        self.status.configure(text=f"Starting {len(urls)} link" + ("" if len(urls) == 1 else "s") + "…",
+                              text_color=MUTED)
         self.worker = threading.Thread(target=self._run, args=(urls, opts), daemon=True)
         self.worker.start()
 
     def _cancel(self):
         self.cancel_flag.set()
-        self._log("Cancelling after current chunk…")
+        self._log("Cancelling after the current chunk…")
 
     def _hook(self, d):
         if self.cancel_flag.is_set():
@@ -165,10 +356,10 @@ class App(tk.Tk):
                 self.log_q.put(("progress", d["downloaded_bytes"] * 100 / total))
             speed = d.get("_speed_str", "").strip()
             eta = d.get("_eta_str", "").strip()
-            self.log_q.put(("status", f"Downloading… {d.get('_percent_str', '').strip()}  {speed}  ETA {eta}"))
+            self.log_q.put(("status", (f"Downloading   {speed}   ETA {eta}", TEXT)))
         elif d["status"] == "finished":
             self.log_q.put(("progress", 100))
-            self.log_q.put(("status", "Processing (merging / converting)…"))
+            self.log_q.put(("status", ("Merging and converting…", MUTED)))
 
     def _ydl_opts(self, url, o):
         is_playlist = "list=" in url and not o["no_playlist"]
@@ -200,10 +391,7 @@ class App(tk.Tk):
             }]
         else:
             h = HEIGHTS[o["quality"]]
-            if h:
-                opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/b"
-            else:
-                opts["format"] = "bv*+ba/b"
+            opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/b" if h else "bv*+ba/b"
             opts["merge_output_format"] = o["container"]
         return opts
 
@@ -213,6 +401,7 @@ class App(tk.Tk):
             if self.cancel_flag.is_set():
                 break
             self._log(f"\n[{i}/{len(urls)}] {url}")
+            self.log_q.put(("progress", 0))
             try:
                 with yt_dlp.YoutubeDL(self._ydl_opts(url, o)) as ydl:
                     rc = ydl.download([url])
@@ -223,7 +412,13 @@ class App(tk.Tk):
                 break
             except Exception as e:  # noqa: BLE001
                 self._log(f"Error: {e}")
-        self.log_q.put(("status", f"Finished — {ok}/{len(urls)} URLs completed"))
+        if self.cancel_flag.is_set():
+            msg, color = "Cancelled.", AMBER
+        elif ok == len(urls):
+            msg, color = f"Done. {ok} of {len(urls)} downloaded.", GREEN
+        else:
+            msg, color = f"Finished with errors. {ok} of {len(urls)} downloaded; see the log.", AMBER
+        self.log_q.put(("status", (msg, color)))
         self.log_q.put(("progress", 0))
         self.log_q.put(("done", None))
 
@@ -240,10 +435,10 @@ class _Logger:
         self.fn(msg)
 
     def warning(self, msg):
-        self.fn(f"WARN: {msg}")
+        self.fn(f"Warning: {msg}")
 
     def error(self, msg):
-        self.fn(f"ERROR: {msg}")
+        self.fn(f"Error: {msg}")
 
 
 if __name__ == "__main__":

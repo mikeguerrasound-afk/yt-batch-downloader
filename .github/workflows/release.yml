@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: >
           pyinstaller --onefile --windowed --name BatchVideoDownloader
-          --collect-all yt_dlp --collect-all imageio_ffmpeg app.py
+          --collect-all yt_dlp --collect-all imageio_ffmpeg --collect-all customtkinter app.py
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path dist/BatchVideoDownloader.exe -DestinationPath BatchVideoDownloader-windows.zip
@@ -42,7 +42,7 @@ jobs:
       - name: Build
         run: >
           pyinstaller --windowed --name BatchVideoDownloader
-          --collect-all yt_dlp --collect-all imageio_ffmpeg app.py
+          --collect-all yt_dlp --collect-all imageio_ffmpeg --collect-all customtkinter app.py
       - name: Zip
         run: ditto -c -k --sequesterRsrc --keepParent dist/BatchVideoDownloader.app BatchVideoDownloader-macos.zip
       - uses: actions/upload-artifact@v4
